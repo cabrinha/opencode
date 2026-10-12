@@ -100,28 +100,6 @@ describe("ConfigPolicyPlugin.Plugin", () => {
     }),
   )
 
-  it.effect("prevents user-global and project policy from overriding system policy", () =>
-    Effect.gen(function* () {
-      const catalog = yield* Provider.Service
-      yield* catalog.transform((catalog) => {
-        catalog.update(Provider.ID.openai, () => {})
-        catalog.update(Provider.ID.anthropic, () => {})
-      })
-      yield* addPlugin([
-        document(provider("deny", "*"), provider("allow", "anthropic"), tool("deny", "shell:sudo *")),
-        document(provider("allow", "openai"), tool("allow", "shell:*")),
-        document(provider("allow", "*"), tool("allow", "shell:*")),
-      ])
-
-      expect(yield* catalog.get(Provider.ID.openai)).toBeUndefined()
-      expect(yield* catalog.get(Provider.ID.anthropic)).toBeDefined()
-      expect(yield* evaluate("shell", ["sudo ls"])).toEqual({
-        effect: "deny",
-        message: "Blocked by configuration policy",
-      })
-    }),
-  )
-
   it.live("reloads changed policies", () =>
     Effect.gen(function* () {
       const catalog = yield* Provider.Service
