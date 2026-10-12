@@ -3,6 +3,7 @@ import fs from "fs/promises"
 import { describe, expect, test } from "bun:test"
 import { Arbitrary, Effect, Fiber, Layer, Logger, Schema, Stream } from "effect"
 import { Config } from "@opencode/core/config"
+import { ConfigDiscovery } from "@opencode/core/config/discovery"
 import { Directory, Document, type Entry, Event, Info } from "@opencode/schema/config"
 import { ConfigModel } from "@opencode/schema/config/model"
 import { ConfigProvider } from "@opencode/schema/config/provider"
@@ -64,7 +65,7 @@ function testLayer(
     ),
   )
   const built = AppNodeBuilder.build(LayerNode.group([Config.node, Bus.node]), [
-    Config.node.replace(Config.configured(options)),
+    Config.node.replace(Config.configured({ system: false, ...options })),
     Location.node.replace(locationLayer),
     Global.node.replace(Global.layerWith({ config: globalDirectory, home: path.join(globalDirectory, "home") })),
     Credential.node.replace(credentialNode),
@@ -200,6 +201,182 @@ describe("Config", () => {
       }),
     ),
   )
+
+  it.live("loads system configuration at lowest priority and excludes it from the project walk", () =>
+    Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
+      Effect.flatMap((tmp) => {
+        const system = path.join(tmp.path, "system")
+        const global = path.join(tmp.path, "global")
+        const project = path.join(tmp.path, "project")
+        const nested = path.join(system, "nested")
+        return Effect.promise(async () => {
+          await fs.mkdir(system, { recursive: true })
+          await fs.mkdir(global, { recursive: true })
+          await fs.mkdir(project, { recursive: true })
+          await fs.mkdir(nested, { recursive: true })
+          await fs.writeFile(
+            path.join(system, "opencode.json"),
+            JSON.stringify({
+              shell: "system",
+              username: "system-user",
+              enabled_providers: ["anthropic"],
+              provider: {
+                company: {
+                  npm: "@ai-sdk/openai-compatible",
+                  api: "https://llm.company.example/v1",
+                },
+              },
+            }),
+          )
+          await fs.writeFile(
+            path.join(global, "opencode.json"),
+            JSON.stringify({
+              shell: "global",
+              experimental: {
+                policies: [{ action: "provider.use", resource: "openai", effect: "allow" }],
+              },
+            }),
+          )
+          await fs.writeFile(path.join(project, "opencode.json"), JSON.stringify({ shell: "project" }))
+        }).pipe(
+          Effect.andThen(
+            Effect.gen(function* () {
+              const config = yield* Config.Service
+              const entries = yield* config.entries()
+              expect(
+                entries.flatMap((entry) => (entry.type === "document" && entry.info.shell ? [entry.info.shell] : [])),
+              ).toEqual(["system", "global", "project"])
+              expect(entries.flatMap((entry) => (entry.type === "directory" ? [entry.path] : []))).toEqual([
+                AbsolutePath.make(system),
+                AbsolutePath.make(global),
+              ])
+              expect(Config.latest(entries, "shell")).toBe("project")
+              expect(Config.latest(entries, "username")).toBe("system-user")
+              expect(entries[0]).toMatchObject({
+                type: "document",
+                path: AbsolutePath.make(path.join(system, "opencode.json")),
+                info: {
+                  providers: {
+                    company: {
+                      package: "aisdk:@ai-sdk/openai-compatible",
+                      settings: { baseURL: "https://llm.company.example/v1" },
+                    },
+                  },
+                  experimental: {
+                    policies: [
+                      { action: "provider.use", resource: "*", effect: "deny" },
+                      { action: "provider.use", resource: "anthropic", effect: "allow" },
+                    ],
+                  },
+                },
+              })
+            }).pipe(
+              Effect.provide(
+                testLayer(project, global, project, undefined, undefined, emptyCredentialNode, emptyWellknownNode, {
+                  system,
+                }),
+              ),
+            ),
+          ),
+          Effect.andThen(
+            // Walking upward from inside the system directory must not re-admit system opencode.json as a project file.
+            Effect.gen(function* () {
+              const config = yield* Config.Service
+              const entries = yield* config.entries()
+              expect(
+                entries.flatMap((entry) => (entry.type === "document" && entry.info.shell ? [entry.info.shell] : [])),
+              ).toEqual(["system", "global"])
+            }).pipe(
+              Effect.provide(
+                testLayer(nested, global, nested, undefined, undefined, emptyCredentialNode, emptyWellknownNode, {
+                  system,
+                }),
+              ),
+            ),
+          ),
+          Effect.andThen(
+            // global: false disables the system directory even when the walk starts beneath it.
+            Effect.gen(function* () {
+              const config = yield* Config.Service
+              expect(yield* config.entries()).toEqual([])
+            }).pipe(
+              Effect.provide(
+                testLayer(nested, global, nested, undefined, undefined, emptyCredentialNode, emptyWellknownNode, {
+                  global: false,
+                  system,
+                }),
+              ),
+            ),
+          ),
+          Effect.andThen(
+            // system: false disables the system directory while keeping global and project active.
+            Effect.gen(function* () {
+              const config = yield* Config.Service
+              const entries = yield* config.entries()
+              expect(
+                entries.flatMap((entry) => (entry.type === "document" && entry.info.shell ? [entry.info.shell] : [])),
+              ).toEqual(["global", "project"])
+            }).pipe(
+              Effect.provide(
+                testLayer(project, global, project, undefined, undefined, emptyCredentialNode, emptyWellknownNode, {
+                  system: false,
+                }),
+              ),
+            ),
+          ),
+          Effect.andThen(
+            // Creating a previously missing system directory reloads configuration.
+            Effect.gen(function* () {
+              const lateSystem = path.join(tmp.path, "late-system")
+              const config = yield* Config.Service
+              const bus = yield* Bus.Service
+              const watcher = yield* Watcher.Test
+              expect(Config.latest(yield* config.entries(), "username")).toBeUndefined()
+              const updated = yield* bus
+                .subscribe(Event.Updated)
+                .pipe(Stream.take(1), Stream.runCollect, Effect.forkScoped({ startImmediately: true }))
+              yield* Effect.sleep("10 millis")
+              yield* Effect.promise(async () => {
+                await fs.mkdir(lateSystem, { recursive: true })
+                await fs.writeFile(path.join(lateSystem, "opencode.json"), JSON.stringify({ username: "late-system" }))
+              })
+              yield* watcher.emit({ type: "create", path: lateSystem })
+              yield* Fiber.join(updated).pipe(Effect.timeout("1 second"))
+              expect(Config.latest(yield* config.entries(), "username")).toBe("late-system")
+            }).pipe(
+              Effect.provide(
+                testLayer(
+                  project,
+                  global,
+                  project,
+                  undefined,
+                  Watcher.testLayer,
+                  emptyCredentialNode,
+                  emptyWellknownNode,
+                  {
+                    system: path.join(tmp.path, "late-system"),
+                  },
+                ),
+              ),
+            ),
+          ),
+        )
+      }),
+    ),
+  )
+
+  test("resolves the system configuration directory per platform", () => {
+    expect(ConfigDiscovery.systemDirectory("darwin", {})).toBe(
+      AbsolutePath.make("/Library/Application Support/opencode"),
+    )
+    expect(ConfigDiscovery.systemDirectory("linux", {})).toBe(AbsolutePath.make("/etc/opencode"))
+    expect(ConfigDiscovery.systemDirectory("win32", { ProgramData: "D:\\ProgramData" })).toBe(
+      AbsolutePath.make(path.join("D:\\ProgramData", "opencode")),
+    )
+    expect(ConfigDiscovery.systemDirectory("win32", {})).toBe(
+      AbsolutePath.make(path.join("C:\\ProgramData", "opencode")),
+    )
+  })
 
   it.live("loads explicit file and content overrides in priority order", () =>
     Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
@@ -395,6 +572,7 @@ describe("Config", () => {
           }).pipe(
             Effect.provide(
               AppNodeBuilder.build(LayerNode.group([Config.node, Bus.node]), [
+                Config.node.replace(Config.configured({ system: false })),
                 Location.node.replace(
                   Layer.succeed(
                     Location.Service,
@@ -618,6 +796,7 @@ describe("Config", () => {
           // Each build is a fresh process sharing one persisted KV store.
           const instance = () =>
             AppNodeBuilder.build(LayerNode.group([Config.node, Bus.node, WellKnown.node]), [
+              Config.node.replace(Config.configured({ system: false })),
               Location.node.replace(
                 Layer.succeed(
                   Location.Service,

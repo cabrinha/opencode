@@ -12,6 +12,7 @@ export const names = ["opencode.json", "opencode.jsonc"]
 
 /** Eligible sources in priority order, including paths that may appear later. */
 export interface Sources {
+  readonly system?: { readonly path: AbsolutePath; readonly present: boolean }
   readonly global?: AbsolutePath
   readonly explicit?: AbsolutePath
   readonly direct: readonly AbsolutePath[]
@@ -20,18 +21,29 @@ export interface Sources {
   readonly agents: readonly AbsolutePath[]
 }
 
+/** Platform system configuration directory (`/Library/Application Support/opencode`, `/etc/opencode`, `%ProgramData%\opencode`). */
+export function systemDirectory(platform: NodeJS.Platform = process.platform, env: NodeJS.ProcessEnv = process.env) {
+  if (platform === "darwin") return AbsolutePath.make("/Library/Application Support/opencode")
+  if (platform === "win32") return AbsolutePath.make(path.join(env.ProgramData || "C:\\ProgramData", "opencode"))
+  return AbsolutePath.make("/etc/opencode")
+}
+
 export const discover = Effect.fn("ConfigDiscovery.discover")(function* (options?: Options) {
   const fs = yield* FSUtil.Service
   const global = yield* Global.Service
   const location = yield* Location.Service
+  const systemDirectoryPath =
+    typeof options?.system === "string" ? AbsolutePath.make(path.resolve(options.system)) : systemDirectory()
   const globalDirectory = AbsolutePath.make(global.config)
   const globalAgentsDirectory = AbsolutePath.make(path.join(global.home, ".agents"))
   const globalClaudeDirectory = AbsolutePath.make(path.join(global.home, ".claude"))
+  const systemRoot = yield* fs.resolve(systemDirectoryPath)
   const globalRoots = yield* Effect.forEach([globalDirectory, globalClaudeDirectory, globalAgentsDirectory], (item) =>
     fs.resolve(item),
   )
+  const currentLocation = yield* fs.resolve(location.directory)
   const directories =
-    (yield* fs.resolve(location.directory)) === globalRoots[0] || options?.project === false
+    currentLocation === systemRoot || currentLocation === globalRoots[0] || options?.project === false
       ? []
       : yield* fs.up({ targets: ["."], start: location.directory }).pipe(Effect.orDie)
   const discovered = yield* Effect.forEach(directories, (directory) =>
@@ -50,17 +62,24 @@ export const discover = Effect.fn("ConfigDiscovery.discover")(function* (options
   )
 
   const globalEnabled = options?.global !== false
+  const systemEnabled = globalEnabled && options?.system !== false
+  const systemFiles = yield* Effect.forEach(names, (name) => fs.resolve(path.join(systemDirectoryPath, name)))
   const globalFiles = yield* Effect.forEach(names, (name) => fs.resolve(path.join(globalDirectory, name)))
-  // Global sources must not re-enter through the project walk.
+  // System and global sources must not re-enter through the project walk.
   const visible = discovered
-    .filter(({ resolved }) =>
-      globalEnabled
-        ? !globalRoots.includes(resolved) && !globalFiles.includes(resolved)
-        : !globalRoots.some((root) => resolved === root || resolved.startsWith(root + path.sep)),
-    )
+    .filter(({ resolved }) => {
+      const excludedBySystem = systemEnabled
+        ? resolved === systemRoot || systemFiles.includes(resolved)
+        : resolved === systemRoot || resolved.startsWith(systemRoot + path.sep)
+      const excludedByGlobal = globalEnabled
+        ? globalRoots.includes(resolved) || globalFiles.includes(resolved)
+        : globalRoots.some((root) => resolved === root || resolved.startsWith(root + path.sep))
+      return !excludedBySystem && !excludedByGlobal
+    })
     .map(({ item }) => item)
 
   return {
+    system: systemEnabled ? { path: systemDirectoryPath, present: yield* fs.isDir(systemDirectoryPath) } : undefined,
     global: globalEnabled ? globalDirectory : undefined,
     explicit: options?.file ? AbsolutePath.make(path.resolve(options.file)) : undefined,
     direct: visible.filter((item) => ![".agents", ".claude", ".opencode"].includes(path.basename(item))).toReversed(),
